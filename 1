@@ -1,0 +1,231 @@
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define OLED_RESET -1
+Adafruit_SSD1306 display(128, 32, &Wire);
+
+// --------------------------------------
+// nRF24 Pins
+// --------------------------------------
+#define CE_PIN   7
+#define CSN_PIN  8
+
+// --------------------------------------
+// Buttons
+// --------------------------------------
+#define BT1 2
+#define BT2 3
+
+volatile uint8_t channelGroup = 0;
+volatile bool jammingEnabled = false;
+
+// --------------------------------------
+// Spectrum
+// --------------------------------------
+#define CHANNELS 64
+uint16_t channelHits[CHANNELS];
+uint8_t waterfall[128];
+
+#define SAMPLE_COUNT 200  // Number of samples per scan
+
+// --------------------------------------
+// nRF24 Registers
+// --------------------------------------
+#define REG_CONFIG     0x00
+#define REG_EN_AA      0x01
+#define REG_RF_CH      0x05
+#define REG_RF_SETUP   0x06
+#define REG_RPD        0x09
+
+// --------------------------------------
+inline void csnLow()  { digitalWrite(CSN_PIN, LOW); }
+inline void csnHigh() { digitalWrite(CSN_PIN, HIGH); }
+inline void ceLow()   { digitalWrite(CE_PIN, LOW); }
+inline void ceHigh()  { digitalWrite(CE_PIN, HIGH); }
+
+// --------------------------------------
+uint8_t readReg(uint8_t reg) {
+  csnLow();
+  SPI.transfer(reg & 0x1F);
+  uint8_t val = SPI.transfer(0xFF);
+  csnHigh();
+  return val;
+}
+
+void writeReg(uint8_t reg, uint8_t val) {
+  csnLow();
+  SPI.transfer((reg & 0x1F) | 0x20);
+  SPI.transfer(val);
+  csnHigh();
+}
+
+// --------------------------------------
+void powerUp() {
+  writeReg(REG_CONFIG, readReg(REG_CONFIG) | 0x02);
+  delayMicroseconds(150);
+}
+
+void setRX() {
+  writeReg(REG_CONFIG, readReg(REG_CONFIG) | 0x01);
+  ceHigh();
+  delayMicroseconds(100);
+}
+
+// --------------------------------------
+// BUTTON ISRs
+// --------------------------------------
+void IRAM_ATTR pressBt1() {
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (now - last > 200) {
+    channelGroup = (channelGroup + 1) % 14;
+  }
+  last = now;
+}
+
+void IRAM_ATTR pressBt2() {
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  if (now - last > 200) {
+    jammingEnabled = !jammingEnabled;
+  }
+  last = now;
+}
+
+// --------------------------------------
+void setup() {
+  Serial.begin(9600);
+
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.display();
+
+  pinMode(BT1, INPUT_PULLUP);
+  pinMode(BT2, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(BT1), pressBt1, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BT2), pressBt2, FALLING);
+
+  pinMode(CE_PIN, OUTPUT);
+  pinMode(CSN_PIN, OUTPUT);
+
+  ceLow();
+  csnHigh();
+
+  SPI.begin();
+  SPI.setDataMode(SPI_MODE0);
+  SPI.setClockDivider(SPI_CLOCK_DIV2);
+  SPI.setBitOrder(MSBFIRST);
+
+  powerUp();
+  writeReg(REG_EN_AA, 0x00);
+  writeReg(REG_RF_SETUP, 0x0F);
+
+  for (int i = 0; i < CHANNELS; i++) channelHits[i] = 0;
+  for (int i = 0; i < 128; i++) waterfall[i] = 0;
+
+  Serial.println("2.4GHz Spectrum Scanner with dB Approximation");
+}
+
+// --------------------------------------
+// dB Approximation Function
+// --------------------------------------
+int16_t approximate_dBm(float ratio) {  // NEW: dB code
+  if (ratio > 0.95) return -50;
+  if (ratio > 0.70) return -60;
+  if (ratio > 0.40) return -70;
+  if (ratio > 0.10) return -80;
+  if (ratio > 0.01) return -90;
+  return -95;  // noise floor
+}
+
+// --------------------------------------
+void scanSpectrum() {
+  ceLow();
+
+  for (int rep = 0; rep < SAMPLE_COUNT; rep++) {
+    for (int i = 0; i < CHANNELS; i++) {
+
+      uint8_t rfCh = (uint8_t)((i * 125UL) / (CHANNELS - 1));
+      writeReg(REG_RF_CH, rfCh);
+
+      setRX();
+      delayMicroseconds(40);
+      ceLow();
+
+      if (readReg(REG_RPD) & 1)
+        channelHits[i]++;
+    }
+  }
+}
+
+// --------------------------------------
+void drawSpectrum() {
+  // Peak channel intensity
+  uint16_t maxHit = 1;
+  for (int i = 0; i < CHANNELS; i++)
+    if (channelHits[i] > maxHit) maxHit = channelHits[i];
+
+  // Calculate bar height
+  uint8_t height = map(maxHit, 0, SAMPLE_COUNT, 0, 31);
+  if (height > 31) height = 31;
+
+  // Shift waterfall
+  for (int x = 127; x > 0; x--)
+    waterfall[x] = waterfall[x - 1];
+
+  waterfall[0] = height;
+
+  display.clearDisplay();
+
+  // Draw waterfall bars
+  for (int x = 0; x < 128; x++) {
+    uint8_t h = waterfall[x];
+    display.drawLine(x, 31, x, 31 - h, WHITE);
+  }
+
+  // Compute dB using the FULL scan average   // NEW: dB code
+  float ratio = float(maxHit) / float(SAMPLE_COUNT);
+  int16_t dBm = approximate_dBm(ratio);
+
+  // Print info
+  display.setCursor(0, 0);
+  display.setTextColor(WHITE);
+  display.setTextSize(1);
+  display.print("Grp:");
+  display.print(channelGroup + 1);
+
+  display.setCursor(45, 0);
+  display.print(dBm);
+  display.print(" dBm");     // NEW: dB readout
+
+  display.setCursor(100, 0);
+  display.print(jammingEnabled ? "JAM" : "SCAN");
+
+  display.display();
+
+  for (int i = 0; i < CHANNELS; i++)
+    channelHits[i] = 0;
+}
+
+// --------------------------------------
+// Simple raw TX bursts (broadband-ish)
+// --------------------------------------
+void doJamming() {
+  ceLow();
+  writeReg(REG_CONFIG, 0x02); // TX mode
+  powerUp();
+
+  for (uint8_t ch = 0; ch < 125; ch++) {
+    writeReg(REG_RF_CH, ch);
+    ceHigh();
+    delayMicroseconds(25);
+    ceLow();
+  }
+}
+
+// --------------------------------------
+void loop() {
+  i
